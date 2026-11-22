@@ -26,6 +26,15 @@
 
 #include <vector>
 #include <string>
+#include <cstdint>
+#include <unordered_map>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+#include <cutils/properties.h>
 
 #include "QtiComposerClient.h"
 
@@ -36,6 +45,25 @@ namespace display {
 namespace composer {
 namespace V3_1 {
 namespace implementation {
+
+namespace {
+constexpr char kLtpoNode[] = "/sys/panel_feature/skip_frame_mode";
+constexpr int kLtpoIndexNoSkip = 16;
+constexpr int kLtpoIndexNone = -1;
+constexpr int kLtpoIndex60 = 7;
+constexpr int kLtpoIndex30 = 8;
+constexpr int kLtpoIndex24 = 9;
+constexpr int kLtpoIndexAuto10 = 1;  // panel-managed idle at 120 Hz, down to 10 Hz
+constexpr int kLtpoIndexAuto1 = 2;   // panel-managed idle at 120 Hz, down to 1 Hz
+constexpr int kLtpoIndex1Dim = 2;   // doze / AOD
+constexpr int kLtpoMaxPendingPresents = 30;
+constexpr uint32_t kLtpoConfig30 = 0xFFFC;
+constexpr uint32_t kLtpoConfig24 = 0xFFFD;
+constexpr uint32_t kLtpoEmulatedConfigs[] = {
+    kLtpoConfig30,
+    kLtpoConfig24,
+};
+}  // namespace
 
 ComposerHandleImporter mHandleImporter;
 
@@ -65,6 +93,343 @@ void BufferCacheEntry::clear() {
 QtiComposerClient::QtiComposerClient() : mWriter(kWriterInitialSize), mReader(*this) {
   hwc_session_ = HWCSession::GetInstance();
   mHandleImporter.initialize();
+
+  char ltpo[PROPERTY_VALUE_MAX] = {};
+  property_get("vendor.display.ltpo", ltpo, "1");
+  char panel[PROPERTY_VALUE_MAX] = {};
+  property_get("ro.vendor.display.panel.type", panel, "");
+  mLtpo_supported_ =
+      (strcmp(ltpo, "0") != 0) && (strcmp(panel, "LTPO_AMOLED") == 0);
+  mLtpoAllow90_ = property_get_bool("vendor.display.ltpo.allow_90", true);
+  mLtpoIndexAuto_ = property_get_bool("vendor.display.ltpo.idle_1hz", false) ? kLtpoIndexAuto1
+                                                                               : kLtpoIndexAuto10;
+  ALOGI("LTPO: panel feature %s (panel type '%s', 90Hz %s, idle %s)",
+        mLtpo_supported_ ? "enabled" : "disabled", panel,
+        mLtpoAllow90_ ? "allowed" : "hidden", mLtpoIndexAuto_ == kLtpoIndexAuto1 ? "1Hz" : "10Hz");
+}
+
+bool QtiComposerClient::LtpoIsPrimary(uint64_t display) const {
+  return display == HWC_DISPLAY_PRIMARY;
+}
+
+bool QtiComposerClient::LtpoIsSyntheticConfig(uint32_t config) const {
+  return config == kLtpoConfig30 || config == kLtpoConfig24;
+}
+
+int32_t QtiComposerClient::LtpoSyntheticPeriodNs(uint32_t config) const {
+  switch (config) {
+    case kLtpoConfig30:
+      return 33333333;
+    case kLtpoConfig24:
+      return 41666667;
+    default:
+      return 0;
+  }
+}
+
+int QtiComposerClient::LtpoFpsForPeriodNs(int64_t period_ns) const {
+  if (period_ns <= 0) return 0;
+  return static_cast<int>(1000000000LL / period_ns + 0.5);
+}
+
+int32_t QtiComposerClient::LtpoAttr(uint64_t display, uint32_t config,
+                                    composer_V2_4::IComposerClient::Attribute attribute) {
+  const int32_t synthetic_period_ns = LtpoSyntheticPeriodNs(config);
+  if (synthetic_period_ns > 0) {
+    if (attribute == composer_V2_4::IComposerClient::Attribute::VSYNC_PERIOD) {
+      return synthetic_period_ns;
+    }
+    const uint32_t real = LtpoMaxFpsConfig(display);
+    if (real == UINT32_MAX) return 0;
+    config = real;
+  }
+  int32_t value = 0;
+  if (hwc_session_->GetDisplayAttribute(display, config, attribute, &value) !=
+      HWC2_ERROR_NONE) {
+    return 0;
+  }
+  return value;
+}
+
+int QtiComposerClient::LtpoFpsForConfig(uint64_t display, uint32_t config) {
+  const int32_t synthetic_period_ns = LtpoSyntheticPeriodNs(config);
+  if (synthetic_period_ns > 0) return LtpoFpsForPeriodNs(synthetic_period_ns);
+  const int32_t period_ns =
+      LtpoAttr(display, config, composer_V2_4::IComposerClient::Attribute::VSYNC_PERIOD);
+  return LtpoFpsForPeriodNs(period_ns);
+}
+
+int QtiComposerClient::LtpoIndexForFps(int fps) const {
+  if (fps >= 80) return mLtpoIndexAuto_;
+  if (fps >= 45) return kLtpoIndex60;
+  if (fps >= 26) return kLtpoIndex30;
+  if (fps >= 20) return kLtpoIndex24;
+  return -1;
+}
+
+int QtiComposerClient::LtpoWrite(int index) const {
+  if (index < 0) return -EINVAL;
+  int fd = open(kLtpoNode, O_WRONLY | O_CLOEXEC);
+  if (fd < 0) {
+    const int error = errno;
+    ALOGW("LTPO: cannot open %s: %s", kLtpoNode, strerror(error));
+    return -error;
+  }
+  char buf[8];
+  const int len = snprintf(buf, sizeof(buf), "%d", index);
+  const ssize_t written = write(fd, buf, len);
+  const int error = written < 0 ? errno : EIO;
+  close(fd);
+  if (written != len) {
+    ALOGW("LTPO: write index %d failed: %s", index, strerror(error));
+    return -error;
+  }
+  return 0;
+}
+
+int QtiComposerClient::LtpoAppliedFps(uint64_t display) {
+  VsyncPeriodNanos period_ns = 0;
+  if (hwc_session_->GetDisplayVsyncPeriod(display, &period_ns) != HWC2_ERROR_NONE) {
+    return 0;
+  }
+  return LtpoFpsForPeriodNs(period_ns);
+}
+
+uint32_t QtiComposerClient::LtpoVirtualConfig(uint64_t display) {
+  {
+    std::lock_guard<std::mutex> lock(mLtpo_mutex_);
+    auto it = mVirtualConfig.find(display);
+    if (it != mVirtualConfig.end()) return it->second;
+  }
+
+  uint32_t config = 0;
+  hwc_session_->GetActiveConfig(display, &config);
+  const int32_t period_ns =
+      LtpoAttr(display, config, composer_V2_4::IComposerClient::Attribute::VSYNC_PERIOD);
+  std::lock_guard<std::mutex> lock(mLtpo_mutex_);
+  auto it = mVirtualConfig.find(display);
+  if (it != mVirtualConfig.end()) return it->second;
+  mVirtualConfig[display] = config;
+  mVirtualPeriodNs[display] = period_ns;
+  return config;
+}
+
+int32_t QtiComposerClient::LtpoCachedPeriodNs(uint64_t display) {
+  std::lock_guard<std::mutex> lock(mLtpo_mutex_);
+  if (mPendingLtpo.count(display)) return 0;
+  auto it = mVirtualPeriodNs.find(display);
+  return it != mVirtualPeriodNs.end() ? it->second : 0;
+}
+
+void QtiComposerClient::LtpoSetActive(uint64_t display, uint32_t config, int32_t period_ns,
+                                      int index) {
+  std::lock_guard<std::mutex> lock(mLtpo_mutex_);
+  mPendingLtpo.erase(display);
+  mVirtualConfig[display] = config;
+  mVirtualPeriodNs[display] = period_ns;
+  mLtpoActiveIndex_ = index;
+}
+
+bool QtiComposerClient::LtpoScreenOn() {
+  std::lock_guard<std::mutex> lock(mLtpo_mutex_);
+  return mLtpoScreenOn_;
+}
+
+void QtiComposerClient::LtpoQueuePending(uint64_t display, const PendingLtpo &pending) {
+  std::lock_guard<std::mutex> lock(mLtpo_mutex_);
+  mPendingLtpo[display] = pending;
+  mVirtualConfig[display] = pending.virtual_config;
+}
+
+void QtiComposerClient::LtpoOnPresent(uint64_t display) {
+  if (!LtpoAvailable() || !LtpoIsPrimary(display)) return;
+  {
+    std::lock_guard<std::mutex> lock(mLtpo_mutex_);
+    if (!mPendingLtpo.count(display)) return;
+  }
+  LtpoProcessPending(display);
+}
+
+void QtiComposerClient::LtpoProcessPending(uint64_t display) {
+  std::lock_guard<std::mutex> io_lock(mLtpo_io_mutex_);
+
+  PendingLtpo pending = {};
+  {
+    std::lock_guard<std::mutex> lock(mLtpo_mutex_);
+    auto it = mPendingLtpo.find(display);
+    if (it == mPendingLtpo.end()) return;
+    pending = it->second;
+  }
+
+  auto rollback = [&](const char *why, int error) {
+    ALOGE("LTPO: giving up on index %d (%s: %s)", pending.index, why, strerror(-error));
+    std::lock_guard<std::mutex> lock(mLtpo_mutex_);
+    mPendingLtpo.erase(display);
+    mVirtualConfig[display] = pending.previous_config;
+    mVirtualPeriodNs[display] = pending.previous_period_ns;
+  };
+  auto store = [&]() {
+    std::lock_guard<std::mutex> lock(mLtpo_mutex_);
+    mPendingLtpo[display] = pending;
+  };
+
+  pending.presents++;
+  if (LtpoAppliedFps(display) != pending.real_fps) {
+    pending.settled = 0;
+    if (pending.presents > kLtpoMaxPendingPresents) {
+      rollback("native mode never applied", -ETIMEDOUT);
+    } else {
+      store();
+    }
+    return;
+  }
+
+  if (++pending.settled < 2) {
+    store();
+    return;
+  }
+
+  if (!LtpoScreenOn()) {
+    LtpoSetActive(display, pending.virtual_config, pending.virtual_period_ns, pending.index);
+    return;
+  }
+
+  const int error = LtpoWrite(pending.index);
+  if (error == -EINVAL && pending.presents <= kLtpoMaxPendingPresents) {
+    store();
+    return;
+  }
+  if (error) {
+    rollback("write failed", error);
+    return;
+  }
+  LtpoSetActive(display, pending.virtual_config, pending.virtual_period_ns, pending.index);
+}
+
+uint32_t QtiComposerClient::LtpoMaxFpsConfig(uint64_t display) {
+  uint32_t count = 0;
+  if (hwc_session_->GetDisplayConfigs(display, &count, nullptr) != HWC2_ERROR_NONE ||
+      count == 0) {
+    return UINT32_MAX;
+  }
+  std::vector<hwc2_config_t> configs(count);
+  if (hwc_session_->GetDisplayConfigs(display, &count, configs.data()) !=
+      HWC2_ERROR_NONE) {
+    return UINT32_MAX;
+  }
+  uint32_t best = UINT32_MAX;
+  int best_fps = 0;
+  for (auto config : configs) {
+    const int fps = LtpoFpsForConfig(display, config);
+    if (fps > best_fps) {
+      best_fps = fps;
+      best = config;
+    }
+  }
+  return best_fps >= 100 ? best : UINT32_MAX;
+}
+
+int32_t QtiComposerClient::LtpoSetPanelConfig(
+    uint64_t display, uint32_t config,
+    const VsyncPeriodChangeConstraints *vsync_period_change_constraints,
+    VsyncPeriodChangeTimeline *timeline) {
+  std::lock_guard<std::mutex> io_lock(mLtpo_io_mutex_);
+
+  const int fps = LtpoFpsForConfig(display, config);
+  if (fps <= 0) {
+    return HWC2_ERROR_BAD_CONFIG;
+  }
+  if (!mLtpoAllow90_ && !LtpoIsSyntheticConfig(config) && fps > 60 && fps < 100) {
+    return HWC2_ERROR_BAD_CONFIG;
+  }
+  const bool emulated = LtpoIsSyntheticConfig(config) || fps < 80;
+  const uint32_t real = emulated ? LtpoMaxFpsConfig(display) : config;
+  if (real == UINT32_MAX) {
+    return HWC2_ERROR_BAD_CONFIG;
+  }
+
+  uint32_t current = 0;
+  auto error = hwc_session_->GetActiveConfig(display, &current);
+  if (error != HWC2_ERROR_NONE) {
+    return error;
+  }
+
+  const uint32_t previous = LtpoVirtualConfig(display);
+  const int32_t previous_period_ns =
+      LtpoAttr(display, previous, composer_V2_4::IComposerClient::Attribute::VSYNC_PERIOD);
+  const int32_t period_ns =
+      LtpoAttr(display, config, composer_V2_4::IComposerClient::Attribute::VSYNC_PERIOD);
+  const int real_fps = LtpoFpsForConfig(display, real);
+  const bool native_low = !emulated && fps < 100;
+  const int index = native_low ? kLtpoIndexNone : LtpoIndexForFps(fps);
+
+  // Drop any skip state before landing on a real timing that rejects it.
+  if (index == kLtpoIndexNone && LtpoScreenOn() && LtpoAppliedFps(display) >= 100) {
+    LtpoWrite(kLtpoIndexNoSkip);
+  }
+
+  if (current != real) {
+    error = vsync_period_change_constraints
+        ? hwc_session_->SetActiveConfigWithConstraints(
+              display, real, vsync_period_change_constraints, timeline)
+        : hwc_session_->SetActiveConfig(display, real);
+    if (error != HWC2_ERROR_NONE) {
+      return error;
+    }
+  }
+
+  if (index == kLtpoIndexNone || !LtpoScreenOn()) {
+    LtpoSetActive(display, config, period_ns, index);
+    return HWC2_ERROR_NONE;
+  }
+
+  // The kernel rejects skip_frame_mode at 60/90 Hz; defer until 120 Hz is applied.
+  if (current != real || LtpoAppliedFps(display) != real_fps) {
+    LtpoQueuePending(display, {real_fps, index, config, period_ns, previous,
+                               previous_period_ns, 0, 0});
+    return HWC2_ERROR_NONE;
+  }
+
+  const int write_error = LtpoWrite(index);
+  if (write_error) {
+    return HWC2_ERROR_NO_RESOURCES;
+  }
+  LtpoSetActive(display, config, period_ns, index);
+  return HWC2_ERROR_NONE;
+}
+
+void QtiComposerClient::LtpoOnPowerMode(uint64_t display, int32_t mode) {
+  if (!LtpoAvailable() || !LtpoIsPrimary(display)) return;
+  std::lock_guard<std::mutex> io_lock(mLtpo_io_mutex_);
+
+  using PowerMode = composer_V2_1::IComposerClient::PowerMode;
+  const bool on = mode == static_cast<int32_t>(PowerMode::ON);
+  {
+    std::lock_guard<std::mutex> lock(mLtpo_mutex_);
+    mPendingLtpo.erase(display);
+    mLtpoScreenOn_ = on;
+  }
+
+  if (mode == static_cast<int32_t>(PowerMode::DOZE) ||
+      mode == static_cast<int32_t>(PowerMode::DOZE_SUSPEND)) {
+    if (LtpoAppliedFps(display) >= 100) {
+      LtpoWrite(kLtpoIndex1Dim);
+    }
+  } else if (on) {
+    uint32_t current = 0;
+    if (hwc_session_->GetActiveConfig(display, &current) == HWC2_ERROR_NONE) {
+      const int32_t period_ns =
+          LtpoAttr(display, current,
+                   composer_V2_4::IComposerClient::Attribute::VSYNC_PERIOD);
+      if (LtpoAppliedFps(display) >= 100) {
+        if (LtpoWrite(mLtpoIndexAuto_) == 0) {
+          LtpoSetActive(display, current, period_ns, mLtpoIndexAuto_);
+        }
+      } else {
+        LtpoSetActive(display, current, period_ns, kLtpoIndexNone);
+      }
+    }
+  }
 }
 
 QtiComposerClient::~QtiComposerClient() {
@@ -131,6 +496,12 @@ void QtiComposerClient::onHotplug(hwc2_callback_data_t callbackData, hwc2_displa
            ret.description().c_str());
 
   if (connect == composer_V2_4::IComposerCallback::Connection::DISCONNECTED) {
+    {
+      std::lock_guard<std::mutex> lock(client->mLtpo_mutex_);
+      client->mVirtualConfig.erase(display);
+      client->mVirtualPeriodNs.erase(display);
+      client->mPendingLtpo.erase(display);
+    }
     // Trigger refresh to make sure disconnect event received/updated properly by SurfaceFlinger.
     client->hwc_session_->Refresh(HWC_DISPLAY_PRIMARY);
     // Wait for sufficient time to ensure sufficient resources are available to process connection.
@@ -163,6 +534,10 @@ void QtiComposerClient::onVsync(hwc2_callback_data_t callbackData, hwc2_display_
 void QtiComposerClient::onVsync_2_4(hwc2_callback_data_t callbackData, hwc2_display_t display,
                                     int64_t timestamp, VsyncPeriodNanos vsyncPeriodNanos) {
   auto client = reinterpret_cast<QtiComposerClient*>(callbackData);
+  if (client && client->LtpoAvailable() && client->LtpoIsPrimary(display)) {
+    const int32_t period_ns = client->LtpoCachedPeriodNs(display);
+    if (period_ns > 0) vsyncPeriodNanos = period_ns;
+  }
   auto ret = client->callback24_->onVsync_2_4(display, timestamp, vsyncPeriodNanos);
   ALOGW_IF(!ret.isOk(), "failed to send onVsync_2_4: %s. SF likely unavailable.",
            ret.description().c_str());
@@ -370,6 +745,10 @@ Return<void> QtiComposerClient::getActiveConfig(uint64_t display, getActiveConfi
   uint32_t config = 0;
   auto error = hwc_session_->GetActiveConfig(display, &config);
 
+  if (error == HWC2_ERROR_NONE && LtpoAvailable() && LtpoIsPrimary(display)) {
+    config = LtpoVirtualConfig(display);
+  }
+
   _hidl_cb(static_cast<Error>(error), config);
 
   return Void();
@@ -408,6 +787,12 @@ Return<void> QtiComposerClient::getColorModes(uint64_t display, getColorModes_cb
 Return<void> QtiComposerClient::getDisplayAttribute(uint64_t display, uint32_t config,
                                                composer_V2_1::IComposerClient::Attribute attribute,
                                                getDisplayAttribute_cb _hidl_cb) {
+  if (LtpoAvailable() && LtpoIsPrimary(display) && LtpoIsSyntheticConfig(config)) {
+    _hidl_cb(Error::NONE,
+             LtpoAttr(display, config,
+                      static_cast<composer_V2_4::IComposerClient::Attribute>(attribute)));
+    return Void();
+  }
   int32_t value = 0;
   auto error = hwc_session_->GetDisplayAttribute(
       display, config, static_cast<composer_V2_4::IComposerClient::Attribute>(attribute), &value);
@@ -429,6 +814,23 @@ Return<void> QtiComposerClient::getDisplayConfigs(uint64_t display,
 
   configs.resize(count);
   error = hwc_session_->GetDisplayConfigs(display, &count, configs.data());
+
+  if (error == HWC2_ERROR_NONE && LtpoAvailable() && LtpoIsPrimary(display)) {
+    size_t out = 0;
+    for (size_t i = 0; i < configs.size(); i++) {
+      const int fps = LtpoFpsForConfig(display, configs[i]);
+      if (!mLtpoAllow90_ && fps > 60 && fps < 100) continue;
+      configs[out++] = configs[i];
+    }
+    if (LtpoMaxFpsConfig(display) != UINT32_MAX) {
+      configs.resize(out + sizeof(kLtpoEmulatedConfigs) / sizeof(kLtpoEmulatedConfigs[0]));
+      for (uint32_t config : kLtpoEmulatedConfigs) {
+        configs[out++] = config;
+      }
+    } else {
+      configs.resize(out);
+    }
+  }
 
   _hidl_cb(static_cast<Error>(error), configs);
   return Void();
@@ -522,6 +924,10 @@ Return<Error> QtiComposerClient::setClientTargetSlotCount(uint64_t display,
 }
 
 Return<Error> QtiComposerClient::setActiveConfig(uint64_t display, uint32_t config) {
+  if (LtpoAvailable() && LtpoIsPrimary(display)) {
+    return static_cast<Error>(LtpoSetPanelConfig(display, config, nullptr, nullptr));
+  }
+
   auto error = hwc_session_->SetActiveConfig(display, config);
 
   return static_cast<Error>(error);
@@ -537,6 +943,10 @@ Return<Error> QtiComposerClient::setPowerMode(uint64_t display,
                                               composer_V2_1::IComposerClient::PowerMode mode) {
   // TODO(user): Implement combinedly w.r.t setPowerMode_2_2
   auto error = hwc_session_->SetPowerMode(display, static_cast<int32_t>(mode));
+
+  if (error == HWC2_ERROR_NONE) {
+    LtpoOnPowerMode(display, static_cast<int32_t>(mode));
+  }
 
   return static_cast<Error>(error);
 }
@@ -714,6 +1124,10 @@ Return<Error> QtiComposerClient::setPowerMode_2_2(uint64_t display,
     return Error::UNSUPPORTED;
   }
   auto error = hwc_session_->SetPowerMode(display, static_cast<int32_t>(mode));
+
+  if (error == HWC2_ERROR_NONE) {
+    LtpoOnPowerMode(display, static_cast<int32_t>(mode));
+  }
 
   return static_cast<Error>(error);
 }
@@ -1119,6 +1533,10 @@ Return<void> QtiComposerClient::getDisplayConnectionType(uint64_t display,
 Return<void> QtiComposerClient::getDisplayAttribute_2_4(
     uint64_t display, uint32_t config, composer_V2_4::IComposerClient::Attribute attribute,
     getDisplayAttribute_2_4_cb _hidl_cb) {
+  if (LtpoAvailable() && LtpoIsPrimary(display) && LtpoIsSyntheticConfig(config)) {
+    _hidl_cb(composer_V2_4::Error::NONE, LtpoAttr(display, config, attribute));
+    return Void();
+  }
   int32_t value = 0;
   auto error = hwc_session_->GetDisplayAttribute(display, config, attribute, &value);
   _hidl_cb(static_cast<composer_V2_4::Error>(error), value);
@@ -1127,8 +1545,12 @@ Return<void> QtiComposerClient::getDisplayAttribute_2_4(
 
 Return<void> QtiComposerClient::getDisplayVsyncPeriod(uint64_t display,
                                                       getDisplayVsyncPeriod_cb _hidl_cb) {
-  VsyncPeriodNanos vsync_period;
+  VsyncPeriodNanos vsync_period = 0;
   auto error = hwc_session_->GetDisplayVsyncPeriod(display, &vsync_period);
+  if (error == HWC2_ERROR_NONE && LtpoAvailable() && LtpoIsPrimary(display)) {
+    const int32_t period_ns = LtpoCachedPeriodNs(display);
+    if (period_ns > 0) vsync_period = period_ns;
+  }
   _hidl_cb(static_cast<composer_V2_4::Error>(error), vsync_period);
   return Void();
 }
@@ -1141,6 +1563,12 @@ Return<void> QtiComposerClient::setActiveConfigWithConstraints(
   timeline.newVsyncAppliedTimeNanos = systemTime();
   timeline.refreshRequired = false;
   timeline.refreshTimeNanos = 0;
+
+  if (LtpoAvailable() && LtpoIsPrimary(display)) {
+    auto error = LtpoSetPanelConfig(display, config, &vsyncPeriodChangeConstraints, &timeline);
+    _hidl_cb(static_cast<composer_V2_4::Error>(error), timeline);
+    return Void();
+  }
 
   auto error = hwc_session_->SetActiveConfigWithConstraints(
       display, config, &vsyncPeriodChangeConstraints, &timeline);
@@ -1524,7 +1952,9 @@ Error QtiComposerClient::CommandReader::presentDisplay(Display display,
     return static_cast<Error>(err);
   }
 
-  return postPresentDisplay(presentFence);
+  auto error = postPresentDisplay(presentFence);
+  mClient.LtpoOnPresent(display);
+  return error;
 }
 
 bool QtiComposerClient::CommandReader::parsePresentDisplay(uint16_t length) {
@@ -1667,6 +2097,7 @@ bool QtiComposerClient::CommandReader::parsePresentOrValidateDisplay(uint16_t le
     }
     // perform post present display.
     postPresentDisplay(&presentFence);
+    mClient.LtpoOnPresent(mDisplay);
   }
 
   return true;

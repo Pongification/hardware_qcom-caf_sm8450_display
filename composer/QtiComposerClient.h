@@ -29,6 +29,8 @@
 #include <hidl/MQDescriptor.h>
 #include <hidl/Status.h>
 #include <log/log.h>
+#include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include <string>
@@ -373,6 +375,54 @@ class QtiComposerClient : public IQtiComposerClient {
   CommandReader mReader;
   std::mutex mDisplayDataMutex;
   std::unordered_map<Display, DisplayData> mDisplayData;
+
+  bool LtpoAvailable() const { return mLtpo_supported_; }
+  bool LtpoIsPrimary(uint64_t display) const;
+  bool LtpoIsSyntheticConfig(uint32_t config) const;
+  int32_t LtpoSyntheticPeriodNs(uint32_t config) const;
+  int LtpoFpsForPeriodNs(int64_t period_ns) const;
+  int LtpoFpsForConfig(uint64_t display, uint32_t config);
+  int LtpoAppliedFps(uint64_t display);
+  uint32_t LtpoMaxFpsConfig(uint64_t display);
+  int LtpoIndexForFps(int fps) const;
+  int32_t LtpoSetPanelConfig(
+      uint64_t display, uint32_t config,
+      const VsyncPeriodChangeConstraints *vsync_period_change_constraints,
+      VsyncPeriodChangeTimeline *timeline);
+  int32_t LtpoCachedPeriodNs(uint64_t display);
+  uint32_t LtpoVirtualConfig(uint64_t display);
+  void LtpoSetActive(uint64_t display, uint32_t config, int32_t period_ns, int index);
+  bool LtpoScreenOn();
+  void LtpoOnPresent(uint64_t display);
+  void LtpoOnPowerMode(uint64_t display, int32_t mode);
+  void LtpoProcessPending(uint64_t display);
+  int LtpoWrite(int index) const;
+  int32_t LtpoAttr(uint64_t display, uint32_t config,
+                   composer_V2_4::IComposerClient::Attribute attribute);
+
+  struct PendingLtpo {
+    int real_fps;
+    int index;
+    uint32_t virtual_config;
+    int32_t virtual_period_ns;
+    uint32_t previous_config;
+    int32_t previous_period_ns;
+    int settled;
+    int presents;
+  };
+  void LtpoQueuePending(uint64_t display, const PendingLtpo &pending);
+
+  bool mLtpo_supported_ = false;
+  std::mutex mLtpo_mutex_;
+  // Never taken from HWC callbacks (display locks are not recursive).
+  std::mutex mLtpo_io_mutex_;
+  std::unordered_map<uint64_t, uint32_t> mVirtualConfig;
+  std::unordered_map<uint64_t, int32_t> mVirtualPeriodNs;
+  std::unordered_map<uint64_t, PendingLtpo> mPendingLtpo;
+  bool mLtpoAllow90_ = true;
+  int mLtpoIndexAuto_ = 1;
+  int mLtpoActiveIndex_ = 2;
+  bool mLtpoScreenOn_ = false;
 };
 
 extern "C" IQtiComposerClient* HIDL_FETCH_IQtiComposerClient(const char* name);
